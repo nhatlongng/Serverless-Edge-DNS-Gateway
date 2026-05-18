@@ -1,7 +1,7 @@
 # 🛡️ Serverless Edge DNS Gateway
 [English](README.md) | [Tiếng Việt](README_VN.md)
 
-Dịch vụ DNS-over-HTTPS (DoH) bảo mật, hiệu năng cao, chạy trên hạ tầng Edge toàn cầu của Cloudflare Pages. Giải pháp tối ưu tốc độ truy cập, độ chính xác vị trí địa lý (ECS) và chặn quảng cáo chuyên nghiệp.
+Dịch vụ DNS-over-HTTPS (DoH) bảo mật, hiệu năng cao, chạy trên hạ tầng Edge toàn cầu của Cloudflare Pages. Giải pháp tối ưu tốc độ truy cập, độ chính xác vị trí địa lý (ECS) và chặn quảng cáo chuyên nghiệp. AB
 
 ---
 
