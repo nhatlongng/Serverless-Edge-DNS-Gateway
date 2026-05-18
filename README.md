@@ -1,7 +1,7 @@
 # 🛡️ Serverless Edge DNS Gateway
 [English](README.md) | [Tiếng Việt](README_VN.md)
 
-A secure, high-performance DNS-over-HTTPS (DoH) proxy running on Cloudflare's global Edge via Pages Functions. Optimized for speed, geographic accuracy (ECS), and professional adblocking.
+A secure, high-performance DNS-over-HTTPS (DoH) proxy running on Cloudflare's global Edge via Pages Functions. Optimized for speed, geographic accuracy (ECS), and professional adblocking. Ah
 
 ---
 
