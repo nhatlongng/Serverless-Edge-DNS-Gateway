@@ -1,5 +1,4 @@
 // ==================== CONFIG ====================
-const SECRET_TOKEN = env.SECRET_TOKEN;
 const UPSTREAM_PRIMARY = 'https://bu0eg1tdzu.cloudflare-gateway.com/dns-query';
 const UPSTREAM_FALLBACK = 'https://rhpcv957tj.cloudflare-gateway.com/dns-query';
 const UPSTREAM_GEO_BYPASS = 'https://dns.mullvad.net/dns-query'; // Re-resolve without ECS when geo-block returns loopback
@@ -84,6 +83,9 @@ async function fetchRedirectRules(url) {
 }
 
 async function refreshBlocklists(baseUrl) {
+  // Skip refresh if:
+  // 1. Already fetched at least once AND
+  // 2. Within refresh interval
   if (blocklistsFetched && Date.now() - blocklistLastFetch < ALL_LISTS_REFRESH_INTERVAL) return;
 
   if (blocklistPromise) return blocklistPromise;
@@ -104,19 +106,21 @@ async function refreshBlocklists(baseUrl) {
         MULLVAD_UPSTREAM_ENABLED ? fetchList(mUrl) : Promise.resolve(new Set())
       ]);
 
+      // Always update state, even if lists are empty (to prevent infinite re-fetch)
       if (AD_BLOCK_ENABLED) { adBlocklist = block; adAllowlist = allow; }
       if (BLOCK_PRIVATE_TLD) { privateTlds = privateList; }
       if (DNS_REDIRECT_ENABLED) { redirectRules = redirRules; }
       if (MULLVAD_UPSTREAM_ENABLED) { mullvadUpstreamDomains = mullvadList; }
 
       blocklistLastFetch = Date.now();
-      blocklistsFetched = true;
+      blocklistsFetched = true; // Mark as fetched to prevent infinite re-fetch
     } finally { blocklistPromise = null; }
   })();
 
   return blocklistPromise;
 }
 
+// Extract QTYPE from first question section
 function extractQtype(buf) {
   try {
     const v = new Uint8Array(buf);
@@ -135,6 +139,7 @@ function extractQtype(buf) {
   } catch { return null; }
 }
 
+// Build set of blocked query types from config
 function getBlockedQtypes() {
   const blocked = new Set();
   if (BLOCK_ANY) blocked.add(255);
@@ -145,6 +150,7 @@ function getBlockedQtypes() {
 }
 const BLOCKED_QTYPES = getBlockedQtypes();
 
+// Parse all question domains
 function extractAllDomains(buf) {
   const domains = [];
   try {
@@ -166,7 +172,7 @@ function extractAllDomains(buf) {
         labels.push(label);
         off += len;
       }
-      off += 4;
+      off += 4; // QTYPE + QCLASS
       if (labels.length > 0) domains.push(labels.join('.').toLowerCase());
     }
   } catch { }
@@ -182,6 +188,7 @@ function hasLoopbackInAnswer(buf) {
     if (an === 0) return false;
 
     let off = 12;
+    // Skip Question Section
     for (let i = 0; i < qd; i++) {
       while (off < v.length) {
         const len = v[off];
@@ -189,10 +196,12 @@ function hasLoopbackInAnswer(buf) {
         if ((len & 0xC0) === 0xC0) { off += 2; break; }
         off += len + 1;
       }
-      off += 4;
+      off += 4; // Type + Class
     }
 
+    // Parse Answer Section
     for (let i = 0; i < an; i++) {
+      // Skip Name (can be compressed)
       while (off < v.length) {
         const len = v[off];
         if (len === 0) { off++; break; }
@@ -204,7 +213,7 @@ function hasLoopbackInAnswer(buf) {
       const cls = (v[off + 2] << 8) | v[off + 3];
       const rdlen = (v[off + 8] << 8) | v[off + 9];
       off += 10;
-      if (type === 1 && cls === 1 && rdlen === 4) {
+      if (type === 1 && cls === 1 && rdlen === 4) { // Type A, Class IN, Length 4
         if (v[off] === 127 && v[off + 1] === 0 && v[off + 2] === 0 && v[off + 3] === 1) return true;
       }
       off += rdlen;
@@ -215,22 +224,34 @@ function hasLoopbackInAnswer(buf) {
 
 function isDomainBlocked(domain) {
   if (!domain || adBlocklist.size === 0) return false;
+
+  // EXACT MATCH ONLY - Check allowlist first (priority)
   if (adAllowlist.has(domain)) return false;
+
+  // EXACT MATCH ONLY - Check blocklist
   if (adBlocklist.has(domain)) return true;
+
   return false;
 }
 
+// Check if domain matches private TLD list (suffix match)
 function isDomainPrivate(domain) {
   if (!domain || privateTlds.size === 0) return false;
+
+  // Exact match (e.g. query for "localhost" or "192.168.1.1")
   if (privateTlds.has(domain)) return true;
+
+  // Suffix match: efficient with substring + indexOf
   let pos = 0;
   while ((pos = domain.indexOf('.', pos)) !== -1) {
     if (privateTlds.has(domain.substring(pos + 1))) return true;
-    pos++;
+    pos++; // Move past the dot
   }
+
   return false;
 }
 
+// Check if domain matches Mullvad upstream list (suffix match including subdomains)
 function isMullvadDomain(domain) {
   if (!domain || mullvadUpstreamDomains.size === 0) return false;
   if (mullvadUpstreamDomains.has(domain)) return true;
@@ -242,11 +263,14 @@ function isMullvadDomain(domain) {
   return false;
 }
 
+// Build NXDOMAIN response (RCODE=3) - Domain does not exist
+// Mirrors query flags (Opcode, AA, TC, RD) per RFC 1035
 function buildNxdomain(query) {
   const v = new Uint8Array(query);
   if (v.length < 12) {
+    // Malformed query → SERVFAIL
     const sf = new Uint8Array(12);
-    sf[2] = 0x84; sf[3] = 0x82;
+    sf[2] = 0x84; sf[3] = 0x82; // QR=1, Opcode=0, AA=1, TC=0, RD=0, RA=1, RCODE=2
     return sf.buffer;
   }
   let qEnd = 12;
@@ -256,18 +280,19 @@ function buildNxdomain(query) {
     if ((len & 0xC0) === 0xC0) { qEnd += 2; break; }
     qEnd += len + 1;
   }
-  qEnd += 4;
+  qEnd += 4; // QTYPE + QCLASS
   const res = new Uint8Array(qEnd);
   res.set(v.slice(0, qEnd));
-  res[2] = 0x80 | (v[2] & 0x7F);
-  res[3] = 0x80 | 0x03;
-  res[4] = 0; res[5] = 1;
-  res[6] = 0; res[7] = 0;
-  res[8] = 0; res[9] = 0;
-  res[10] = 0; res[11] = 0;
+  res[2] = 0x80 | (v[2] & 0x7F); // QR=1, mirror Opcode/AA/TC/RD from query
+  res[3] = 0x80 | 0x03;           // RA=1, RCODE=3 (NXDOMAIN)
+  res[4] = 0; res[5] = 1; // QDCOUNT=1
+  res[6] = 0; res[7] = 0; // ANCOUNT=0
+  res[8] = 0; res[9] = 0; // NSCOUNT=0
+  res[10] = 0; res[11] = 0; // ARCOUNT=0
   return res.buffer;
 }
 
+// NODATA response: RCODE=0 (NOERROR), ANCOUNT=0 — domain exists but no records of this type
 function buildNodata(query) {
   const v = new Uint8Array(query);
   if (v.length < 12) {
@@ -285,10 +310,10 @@ function buildNodata(query) {
   qEnd += 4;
   const res = new Uint8Array(qEnd);
   res.set(v.slice(0, qEnd));
-  res[2] = 0x80 | (v[2] & 0x7F);
-  res[3] = 0x80;
+  res[2] = 0x80 | (v[2] & 0x7F); // QR=1, mirror flags
+  res[3] = 0x80;                  // RA=1, RCODE=0 (NOERROR)
   res[4] = 0; res[5] = 1;
-  res[6] = 0; res[7] = 0;
+  res[6] = 0; res[7] = 0; // ANCOUNT=0
   res[8] = 0; res[9] = 0;
   res[10] = 0; res[11] = 0;
   return res.buffer;
@@ -298,7 +323,7 @@ function buildServfail(query) {
   const v = new Uint8Array(query);
   if (v.length < 12) {
     const sf = new Uint8Array(12);
-    sf[2] = 0x84; sf[3] = 0x82;
+    sf[2] = 0x84; sf[3] = 0x82; // QR=1, AA=1, RA=1, RCODE=2
     return sf.buffer;
   }
   let qEnd = 12;
@@ -311,8 +336,8 @@ function buildServfail(query) {
   qEnd += 4;
   const res = new Uint8Array(qEnd);
   res.set(v.slice(0, qEnd));
-  res[2] = 0x80 | (v[2] & 0x7F);
-  res[3] = 0x80 | 0x02;
+  res[2] = 0x80 | (v[2] & 0x7F); // QR=1, mirror Opcode/AA/TC/RD
+  res[3] = 0x80 | 0x02;           // RA=1, RCODE=2 (SERVFAIL)
   res[4] = 0; res[5] = 1;
   res[6] = 0; res[7] = 0;
   res[8] = 0; res[9] = 0;
@@ -321,22 +346,27 @@ function buildServfail(query) {
 }
 
 // ==================== ECS INJECTION ====================
+// Inject EDNS Client Subnet (ECS) into DNS query per RFC 7871
+// Adds client subnet info for geo-optimized CDN responses
 function injectECS(query, clientIP) {
   if (!ECS_INJECTION_ENABLED || !clientIP || clientIP === 'unknown') return query;
   try {
     const v = new Uint8Array(query);
     if (v.length < 12) return query;
 
+    // Strip existing OPT records
     const clean = stripOPT(v);
 
+    // Handle IPv4-mapped IPv6 addresses (::ffff:x.x.x.x)
     const ipv4Mapped = clientIP.match(IPV4_MAPPED_REGEX);
     if (ipv4Mapped) clientIP = ipv4Mapped[1];
 
+    // Build ECS data
     let family, prefixLen, addrBytes;
     if (clientIP.includes(':')) {
       family = 2; prefixLen = ECS_PREFIX_V6;
       const allBytes = ipv6ToBytes(clientIP);
-      if (!allBytes) return query;
+      if (!allBytes) return query; // Invalid IPv6 address, skip ECS injection
       const byteLen = Math.ceil(prefixLen / 8);
       addrBytes = allBytes.slice(0, byteLen);
     } else {
@@ -347,6 +377,7 @@ function injectECS(query, clientIP) {
       addrBytes = parts.slice(0, byteLen).map(Number);
     }
 
+    // Mask unused trailing bits per RFC 7871 (e.g., /24 prefix → mask last byte)
     if (addrBytes.length > 0 && prefixLen % 8 !== 0) {
       const maskBits = prefixLen % 8;
       const mask = (0xFF << (8 - maskBits)) & 0xFF;
@@ -355,20 +386,22 @@ function injectECS(query, clientIP) {
 
     const ecsLen = 4 + addrBytes.length;
     const ecs = new Uint8Array(4 + ecsLen);
-    ecs[0] = 0; ecs[1] = 8;
+    ecs[0] = 0; ecs[1] = 8; // option code 8 (ECS)
     ecs[2] = (ecsLen >> 8) & 0xFF; ecs[3] = ecsLen & 0xFF;
     ecs[4] = (family >> 8) & 0xFF; ecs[5] = family & 0xFF;
-    ecs[6] = prefixLen; ecs[7] = 0;
+    ecs[6] = prefixLen; ecs[7] = 0; // scope = 0
     for (let i = 0; i < addrBytes.length; i++) ecs[8 + i] = addrBytes[i];
 
+    // OPT record
     const opt = new Uint8Array(11 + ecs.length);
-    opt[0] = 0;
-    opt[1] = 0; opt[2] = 41;
-    opt[3] = 16; opt[4] = 0;
-    opt[5] = 0; opt[6] = 0; opt[7] = 0; opt[8] = 0;
+    opt[0] = 0; // root
+    opt[1] = 0; opt[2] = 41; // type OPT
+    opt[3] = 16; opt[4] = 0; // UDP 4096
+    opt[5] = 0; opt[6] = 0; opt[7] = 0; opt[8] = 0; // ext RCODE
     opt[9] = (ecs.length >> 8) & 0xFF; opt[10] = ecs.length & 0xFF;
     opt.set(ecs, 11);
 
+    // Increment ARCOUNT to account for new OPT record
     const currentArCount = (clean[10] << 8) | clean[11];
     const newArCount = currentArCount + 1;
 
@@ -381,6 +414,8 @@ function injectECS(query, clientIP) {
   } catch { return query; }
 }
 
+// Strip existing OPT (EDNS) records from DNS query
+// Validates rdata bounds and correctly rebuilds ARCOUNT
 function stripOPT(view) {
   let off = 12;
   const qd = (view[4] << 8) | view[5];
@@ -405,11 +440,13 @@ function stripOPT(view) {
     if (off + 10 > view.length) break;
     off += 10 + ((view[off + 8] << 8) | view[off + 9]);
   }
+  // Parse AR section: iterate each record, keep non-OPT, drop TYPE=41
   const ar = (view[10] << 8) | view[11];
   let arOff = off;
   const keptRecords = [];
   for (let i = 0; i < ar && arOff < view.length; i++) {
     const recStart = arOff;
+    // Skip Name
     while (arOff < view.length) {
       const l = view[arOff];
       if (l === 0) { arOff++; break; }
@@ -419,12 +456,14 @@ function stripOPT(view) {
     if (arOff + 10 > view.length) break;
     const type = (view[arOff] << 8) | view[arOff + 1];
     const rdlen = (view[arOff + 8] << 8) | view[arOff + 9];
+    // Validate rdata length fits within buffer bounds
     if (arOff + 10 + rdlen > view.length) break;
     arOff += 10 + rdlen;
     if (type !== 41) {
       keptRecords.push(view.subarray(recStart, arOff));
     }
   }
+  // Rebuild buffer without OPT records
   let totalLen = off;
   for (const rec of keptRecords) totalLen += rec.length;
   const r = new Uint8Array(totalLen);
@@ -434,24 +473,28 @@ function stripOPT(view) {
     r.set(rec, writeOff);
     writeOff += rec.length;
   }
+  // Set ARCOUNT to number of kept additional records (excluding removed OPT)
   r[10] = (keptRecords.length >> 8) & 0xFF;
   r[11] = keptRecords.length & 0xFF;
   return r;
 }
 
+// Convert IPv6 address string to 16-byte array
+// Validates format, handles :: compression, rejects invalid input
 function ipv6ToBytes(ip) {
   try {
     if (!ip || typeof ip !== 'string') return null;
     if (!IPV6_VALID_REGEX.test(ip)) return null;
 
     const halves = ip.split('::');
-    if (halves.length > 2) return null;
+    if (halves.length > 2) return null; // Multiple :: is invalid
 
     const left = halves[0] ? halves[0].split(':').filter(x => x) : [];
     const right = halves.length > 1 && halves[1] ? halves[1].split(':').filter(x => x) : [];
     const totalGroups = left.length + right.length;
     if (totalGroups > 8) return null;
 
+    // Validate each group
     for (const g of [...left, ...right]) {
       if (g.length > 4 || !IPV6_GROUP_REGEX.test(g)) return null;
     }
@@ -559,15 +602,15 @@ function buildRedirectResponse(originalQuery, upstreamResponse, originalDomain, 
     if (uOff + rdlen > uv.length) break;
 
     let rdata = uv.slice(uOff, uOff + rdlen);
-    if (type === 5 || type === 2 || type === 12) {
+    if (type === 5 || type === 2 || type === 12) { // CNAME, NS, PTR
       rdata = encodeDomainName(decodeName(uv, uOff).name);
-    } else if (type === 15) {
+    } else if (type === 15) { // MX
       const pref = uv.slice(uOff, uOff + 2);
       const name = encodeDomainName(decodeName(uv, uOff + 2).name);
       const combined = new Uint8Array(2 + name.length);
       combined.set(pref); combined.set(name, 2);
       rdata = combined;
-    } else if (type === 33) {
+    } else if (type === 33) { // SRV
       const fixed = uv.slice(uOff, uOff + 6);
       const name = encodeDomainName(decodeName(uv, uOff + 6).name);
       const combined = new Uint8Array(6 + name.length);
@@ -598,11 +641,11 @@ function buildRedirectResponse(originalQuery, upstreamResponse, originalDomain, 
   res[10] = 0; res[11] = 0;
 
   let off = oQEnd;
-  res[off++] = 0xC0; res[off++] = 0x0C;
-  res[off++] = 0x00; res[off++] = 0x05;
-  res[off++] = 0x00; res[off++] = 0x01;
+  res[off++] = 0xC0; res[off++] = 0x0C; // Pointer to original query name
+  res[off++] = 0x00; res[off++] = 0x05; // TYPE CNAME
+  res[off++] = 0x00; res[off++] = 0x01; // CLASS IN
   res[off++] = 0x00; res[off++] = 0x00;
-  res[off++] = 0x01; res[off++] = 0x2C;
+  res[off++] = 0x01; res[off++] = 0x2C; // TTL 300
   res[off++] = (targetWire.length >> 8) & 0xFF;
   res[off++] = targetWire.length & 0xFF;
   res.set(targetWire, off); off += targetWire.length;
@@ -619,6 +662,7 @@ function buildRedirectResponse(originalQuery, upstreamResponse, originalDomain, 
   return res.buffer;
 }
 
+
 // ==================== DNS FORWARDING ====================
 async function forwardQuery(query, upstream) {
   const res = await fetch(upstream, {
@@ -631,6 +675,8 @@ async function forwardQuery(query, upstream) {
   return await res.arrayBuffer();
 }
 
+// Resolve DNS query with fallback and geo-bypass logic
+// Returns SERVFAIL on upstream errors, NXDOMAIN for geo-blocked domains
 async function resolveQuery(query, clientIP) {
   const processed = injectECS(query, clientIP);
   let result;
@@ -640,16 +686,20 @@ async function resolveQuery(query, clientIP) {
     try {
       result = await forwardQuery(processed, UPSTREAM_FALLBACK);
     } catch {
+      // Both primary and fallback upstream failed
       return buildServfail(query);
     }
   }
 
+  // If response contains 127.0.0.1, re-resolve via geo-bypass upstream (without ECS geo-lock)
   if (result && hasLoopbackInAnswer(result)) {
     try {
       const respMullvad = await forwardQuery(processed, UPSTREAM_GEO_BYPASS);
       if (!hasLoopbackInAnswer(respMullvad)) return respMullvad;
+      // Mullvad success nhưng vẫn có loopback → geo-block thực sự
       return buildNxdomain(query);
     } catch {
+      // Mullvad upstream failed (timeout or network error)
       return buildServfail(query);
     }
   }
@@ -658,20 +708,15 @@ async function resolveQuery(query, clientIP) {
 }
 
 // ==================== HELPERS ====================
+// Ensure blocklists are loaded (await on first load, background refresh after)
 async function ensureBlocklistsLoaded(url, context) {
   if (!blocklistsFetched) {
+    // First time: await to ensure lists are loaded
     await refreshBlocklists(url);
   } else if (context) {
+    // Already fetched: background refresh only
     context.waitUntil(refreshBlocklists(url));
   }
-}
-
-// ==================== AUTH CHECK ====================
-function isAuthorized(request) {
-  const url = new URL(request.url);
-  const tokenFromQuery = url.searchParams.get('token');
-  const tokenFromHeader = request.headers.get('X-Auth-Token');
-  return tokenFromQuery === SECRET_TOKEN || tokenFromHeader === SECRET_TOKEN;
 }
 
 // ==================== HANDLERS ====================
@@ -694,6 +739,7 @@ async function handleDNSQuery(request, context) {
     return new Response('Method not allowed', { status: 405, headers: cors });
   }
 
+  // Block unwanted query types early to save upstream requests
   if (BLOCKED_QTYPES.size > 0) {
     const qtype = extractQtype(query);
     if (qtype !== null && BLOCKED_QTYPES.has(qtype)) {
@@ -703,13 +749,16 @@ async function handleDNSQuery(request, context) {
     }
   }
 
+  // Load data if any domain-based filter is enabled
   if (AD_BLOCK_ENABLED || BLOCK_PRIVATE_TLD || DNS_REDIRECT_ENABLED || MULLVAD_UPSTREAM_ENABLED) {
     await ensureBlocklistsLoaded(request.url, context);
 
+    // Parse domains once for both filters
     const domains = extractAllDomains(query);
     for (const domain of domains) {
       if (!domain) continue;
 
+      // Mullvad Dedicated Upstream
       if (MULLVAD_UPSTREAM_ENABLED && isMullvadDomain(domain)) {
         try {
           const processed = injectECS(query, clientIP);
@@ -724,18 +773,21 @@ async function handleDNSQuery(request, context) {
         }
       }
 
+      // Private TLD check (NXDOMAIN)
       if (BLOCK_PRIVATE_TLD && isDomainPrivate(domain)) {
         return new Response(buildNxdomain(query), {
           headers: { ...cors, 'Content-Type': 'application/dns-message', 'X-Blocked-Private': domain }
         });
       }
 
+      // Ad block check (NXDOMAIN)
       if (AD_BLOCK_ENABLED && isDomainBlocked(domain)) {
         return new Response(buildNxdomain(query), {
           headers: { ...cors, 'Content-Type': 'application/dns-message', 'X-Blocked': domain }
         });
       }
 
+      // DNS redirect: rewrite QNAME, forward to upstream, rebuild response with CNAME + answers
       if (DNS_REDIRECT_ENABLED && redirectRules.has(domain)) {
         const targetDomain = redirectRules.get(domain);
         try {
@@ -745,11 +797,14 @@ async function handleDNSQuery(request, context) {
           return new Response(redirected, {
             headers: { ...cors, 'Content-Type': 'application/dns-message', 'X-Redirected': `${domain} -> ${targetDomain}` }
           });
-        } catch { }
+        } catch {
+          // Redirect failed, fall through to normal resolution
+        }
       }
     }
   }
 
+  // Forward to upstream
   try {
     const data = await resolveQuery(query, clientIP);
     return new Response(data, {
@@ -761,19 +816,8 @@ async function handleDNSQuery(request, context) {
 }
 
 // ==================== ROUTING ====================
-async function handleRequest(request, context, env) {
-  const url = new URL(request.url);
-  const path = url.pathname;
-
-  // Public paths — no token required
-  if (path === '/' || path === '') {
-    return; // Let static index.html serve
-  }
-
-  // All other paths require token
-  if (!isAuthorized(request)) {
-    return new Response('Unauthorized', { status: 401 });
-  }
+async function handleRequest(request, context) {
+  const path = new URL(request.url).pathname;
 
   if (path === '/dns-query') return handleDNSQuery(request, context);
 
@@ -795,7 +839,7 @@ async function handleRequest(request, context, env) {
 
   if (path === '/apple') {
     const host = new URL(request.url).hostname;
-    const dohUrl = `https://${host}/dns-query?token=${SECRET_TOKEN}`;
+    const dohUrl = `https://${host}/dns-query`;
     const uuid1 = crypto.randomUUID();
     const uuid2 = crypto.randomUUID();
     const uuid3 = crypto.randomUUID();
@@ -853,9 +897,10 @@ async function handleRequest(request, context, env) {
     });
   }
 
+  // Unknown route — return 404 (landing page served as static index.html)
   return new Response('Not Found', { status: 404 });
 }
 
 export async function onRequest(context) {
-  return handleRequest(context.request, context, context.env);
+  return handleRequest(context.request, context);
 }
